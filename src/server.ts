@@ -1,6 +1,7 @@
 import { Server, Socket } from 'socket.io';
 import Redis from 'ioredis';
 import * as admin from 'firebase-admin';
+import 'dotenv/config';
 
 // 1. Initialize Redis (Updated for Upstash / Render)
 // Make sure REDIS_URL in Render is set to your Upstash string (rediss://...)
