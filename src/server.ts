@@ -1,7 +1,21 @@
 import { Server, Socket } from 'socket.io';
 import Redis from 'ioredis';
 import * as admin from 'firebase-admin';
+import express from 'express';
+import http from 'http';
+import cors from 'cors';
 import 'dotenv/config';
+
+const app = express();
+app.use(cors());
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
 
 // 1. Initialize Redis (Updated for Upstash / Render)
 // Make sure REDIS_URL in Render is set to your Upstash string (rediss://...)
@@ -167,3 +181,10 @@ export const setupMapSockets = (io: Server) => {
     });
   });
 };
+
+setupMapSockets(io);
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`🚀 Server listening on port ${PORT}`);
+});
