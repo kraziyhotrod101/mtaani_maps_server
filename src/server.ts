@@ -6,6 +6,9 @@ import http from 'http';
 import cors from 'cors';
 import 'dotenv/config';
 
+// ==========================================
+// 1. App & Server Setup
+// ==========================================
 const app = express();
 app.use(cors());
 
@@ -17,29 +20,25 @@ const io = new Server(server, {
   }
 });
 
-// 1. Initialize Redis (Updated for Upstash / Render)
-// Make sure REDIS_URL in Render is set to your Upstash string (rediss://...)
+// ==========================================
+// 2. Redis Setup (Upstash / Render)
+// ==========================================
 const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const redis = new Redis(redisUrl, {
-  // These options help keep the Upstash connection stable on serverless/cloud platforms
   retryStrategy: (times) => Math.min(times * 50, 2000),
   maxRetriesPerRequest: null,
 });
 
-redis.on('connect', () => {
-  console.log('✅ Successfully connected to Upstash Redis!');
-});
+redis.on('connect', () => console.log('✅ Successfully connected to Upstash Redis!'));
+redis.on('error', (err) => console.error('❌ Redis Connection Error:', err));
 
-redis.on('error', (err) => {
-  console.error('❌ Redis Connection Error:', err);
-});
-
-// 2. Initialize Firebase Admin (Updated for Render)
+// ==========================================
+// 3. Firebase Admin Setup
+// ==========================================
 if (!admin.apps.length) {
   const base64Credentials = process.env.FIREBASE_CREDENTIALS_BASE64;
 
   if (base64Credentials) {
-    // Uses the Base64 string if you added it to Render Environment Variables
     try {
       const serviceAccount = JSON.parse(
         Buffer.from(base64Credentials, 'base64').toString('utf-8')
@@ -52,31 +51,64 @@ if (!admin.apps.length) {
       console.error('❌ Failed to parse Firebase Base64 credentials:', error);
     }
   } else {
-    // Fallback if you used the Render "Secret File" method instead
     admin.initializeApp({
       credential: admin.credential.applicationDefault(),
+      projectId: 'mtaani-jobs-9f1e4'
     });
     console.log('✅ Firebase initialized using Default Credentials (Secret File).');
   }
 }
 
-/**
- * Attaches the map tracking logic to an existing Socket.IO server instance.
- * @param io The initialized Socket.IO server
- */
+// ==========================================
+// 4. Standalone FCM Test Function
+// ==========================================
+export const sendTestNotification = async (targetFcmToken: string, chatId: string, senderName: string) => {
+  const payload = {
+    notification: {
+      title: `New message from ${senderName}`,
+      body: 'Hey, I am on my way!',
+    },
+    data: {
+      type: 'new_chat_message', 
+      click_action: 'FLUTTER_NOTIFICATION_CLICK',
+      related_id: chatId,
+      metadata: JSON.stringify({
+        senderId: "user_789",
+        timestamp: new Date().toISOString()
+      })
+    }
+  };
+
+  try {
+    await admin.messaging().send({
+      ...payload,
+      token: targetFcmToken,
+    });
+    console.log(`🔔 Notification sent successfully to token: ${targetFcmToken}`);
+  } catch (error: any) {
+    if (
+      error.code === 'messaging/invalid-registration-token' ||
+      error.code === 'messaging/registration-token-not-registered'
+    ) {
+      console.warn(`⚠️ Invalid or expired FCM token detected: ${targetFcmToken}`);
+    } else {
+      console.error('❌ Failed to send FCM notification:', error);
+    }
+  }
+};
+
+// ==========================================
+// 5. Socket.IO Map Tracking Logic
+// ==========================================
 export const setupMapSockets = (io: Server) => {
   io.on('connection', (socket: Socket) => {
     console.log(`📡 User connected to map sockets: ${socket.id}`);
 
-    /**
-     * 1. Employer joins the map view
-     */
+    // Employer joins the map view
     socket.on('joinTask', async (taskId: string) => {
       socket.join(taskId);
       console.log(`👀 Socket ${socket.id} joined task room: ${taskId}`);
 
-      // Instantly retrieve the last known cached location from Redis 
-      // so the employer's map doesn't load blank.
       try {
         const cachedLocation = await redis.hgetall(`task_location:${taskId}`);
         if (cachedLocation && cachedLocation.lat && cachedLocation.lng) {
@@ -92,24 +124,12 @@ export const setupMapSockets = (io: Server) => {
       }
     });
 
-    /**
-     * 2. Worker presses "Indicate Traveling"
-     */
+    // Worker presses "Indicate Traveling"
     socket.on('workerTraveling', async (data: any) => {
-      const {
-        taskId,
-        eta,
-        message,
-        employerFcmToken,
-        taskLocation,
-        startLat,
-        startLng,
-      } = data;
+      const { taskId, eta, message, employerFcmToken, taskLocation, startLat, startLng } = data;
 
-      // Broadcast to anyone (employer) currently viewing the map live
       io.to(taskId).emit('workerTraveling', data);
 
-      // Cache the initial starting coordinates
       if (startLat && startLng) {
         const redisKey = `task_location:${taskId}`;
         try {
@@ -118,13 +138,12 @@ export const setupMapSockets = (io: Server) => {
             lng: startLng.toString(),
             timestamp: Date.now().toString(),
           });
-          await redis.expire(redisKey, 7200); // Expires in 2 hours
+          await redis.expire(redisKey, 7200); 
         } catch (error) {
           console.error('❌ Redis Caching error on start:', error);
         }
       }
 
-      // Trigger Push Notification so the Employer can tap and open the map
       if (employerFcmToken) {
         const payload = {
           notification: {
@@ -132,7 +151,7 @@ export const setupMapSockets = (io: Server) => {
             body: `ETA: ${eta}. ${message || 'Tap to view live location.'}`,
           },
           data: {
-            type: 'travel', // Triggers the map routing case in flutter
+            type: 'travel',
             related_id: taskId.toString(),
             location: JSON.stringify(taskLocation || {}),
             click_action: 'FLUTTER_NOTIFICATION_CLICK',
@@ -151,15 +170,12 @@ export const setupMapSockets = (io: Server) => {
       }
     });
 
-    /**
-     * 3. Worker's GPS streams updates
-     */
+    // Worker's GPS streams updates
     socket.on('updateLocation', async (data: any) => {
       const { taskId, lat, lng } = data;
 
       if (!taskId || lat === undefined || lng === undefined) return;
 
-      // Cache with Redis Hash to ensure seamless reconnects
       const redisKey = `task_location:${taskId}`;
       try {
         await redis.hset(redisKey, {
@@ -167,12 +183,11 @@ export const setupMapSockets = (io: Server) => {
           lng: lng.toString(),
           timestamp: Date.now().toString(),
         });
-        await redis.expire(redisKey, 7200); // Reset the 2-hour expiration
+        await redis.expire(redisKey, 7200); 
       } catch (error) {
         console.error('❌ Redis update caching error:', error);
       }
 
-      // Broadcast the coordinates to the employer in the room
       io.to(taskId).emit('locationUpdated', { lat, lng });
     });
 
@@ -184,6 +199,23 @@ export const setupMapSockets = (io: Server) => {
 
 setupMapSockets(io);
 
+// ==========================================
+// 6. Test Execution Block
+// ==========================================
+// Note: Remove or comment this block out before deploying to production!
+//const testToken = "fNAYyDQ0RJqJbiBiDdC6Fx:APA91bF_dLpSh2276dc9NGgEMwMdv5NlnH00YmhOfl_ER0A88XKhHgoE8ZyoxJoUAC1re87WhwLwJVyf-rdEoQi6UkmdXNsE4Dv06_raZPzpK0itvOjWIw4";
+
+//sendTestNotification(
+  //testToken, 
+  //"test_chat_001", 
+  //"System Admin"
+//).then(() => {
+  //console.log("✅ Test execution finished.");
+//});
+
+// ==========================================
+// 7. Start Server
+// ==========================================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
